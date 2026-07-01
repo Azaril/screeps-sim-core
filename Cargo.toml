@@ -1,0 +1,21 @@
+[package]
+name = "screeps-sim-core"
+version = "0.1.0"
+authors = ["William Archbell <william@archbell.com>"]
+edition = "2021"
+description = "Shared, combat-agnostic Screeps movement/world simulation kernel (terrain, body, same-tile contention resolver, fatigue, edge-exit, per-tick world, recording) — the JS-free mechanism layer both the combat sim (screeps-combat-engine) and the rover benchmark (screeps-rover-eval) build on. Extracted from screeps-combat-engine (ADR 0033)."
+
+# A workspace MEMBER, host+wasm-buildable like screeps-combat-engine: pure logic over
+# screeps-game-api value types, no host-only deps. Inherits the workspace [patch].
+
+[features]
+default = []
+# The offline rover driver (implements the screeps-rover movement traits over a SimWorld);
+# adds the screeps-rover dependency. Off by default so a pure-mechanism consumer (combat-engine)
+# need not pull rover. Enabled by screeps-combat-agent + screeps-rover-eval.
+rover = ["dep:screeps-rover"]
+
+[dependencies]
+screeps-game-api = "0.23"
+serde = { version = "1", features = ["derive"] }
+screeps-rover = { path = "../screeps-rover", optional = true }
