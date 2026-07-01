@@ -44,9 +44,12 @@ pub struct MoverConfig {
     /// friendly-avoid → all-friendly → more-ops → shove → report-failure.
     pub stuck_thresholds: StuckThresholds,
     /// Register unrequested same-side creeps as resolver-known stationary occupants
-    /// (`set_idle_creep_positions`). OPT-IN, default `false`: proactive avoidance without the
-    /// denial-as-stuck signal starves sealed corridors (see the registration block in
-    /// [`resolve_moves_via_system_with`]); flips to default-on when that follow-up slice lands.
+    /// (`set_idle_creep_positions`). Default `true` since the parked-creep-coordination-v2 slice
+    /// landed (ADR 0033 M5 follow-up #2): denial-as-stuck restores the escalation ladder through
+    /// avoidance dances, and shoveable synthesized idle entries let movers displace
+    /// corridor-mouth parkers — the two mechanisms that made registration safe (see the
+    /// registration block in [`resolve_moves_via_system_with`]). Kept as an opt-OUT so the
+    /// pre-registration behavior stays reachable for A/B runs.
     pub register_idle_creeps: bool,
 }
 
@@ -58,7 +61,7 @@ impl Default for MoverConfig {
             pathfinding_ops_budget: 20_000,
             friendly_creep_distance: screeps_rover::DEFAULT_FRIENDLY_CREEP_DISTANCE,
             stuck_thresholds: StuckThresholds::default(),
-            register_idle_creeps: false,
+            register_idle_creeps: true,
         }
     }
 }
@@ -81,6 +84,11 @@ pub struct SimMoveRequest {
     pub creep: CreepId,
     pub goal: SimMoveGoal,
     pub priority: MovementPriority,
+    /// Optional NUMERIC priority on rover's shared i64 lane (`MovementPriority::anchor_value`
+    /// documents the enum anchors + spacing) — the §D5.4 w-as-priority substrate: a quantized
+    /// `w(creep)` in milli-e/t slots between the enum tiers. `None` = the enum anchor
+    /// (byte-identical ordering).
+    pub priority_value: Option<i64>,
     /// Allow the resolver to SHOVE/swap others to reach the tile (the rover default). Toggle off to A/B
     /// shoving's effect on positioning (the investigated control).
     pub shove: bool,
@@ -88,6 +96,10 @@ pub struct SimMoveRequest {
     /// `range` of `center` so a cohesive squad can't be scattered off its scored tiles (the rover
     /// `AnchorConstraint`). `None` = unconstrained.
     pub anchor: Option<(Position, u32)>,
+    /// Per-request stuck-escalation ladder override (rover's split-defaults end-state, ADR 0033
+    /// M5: haul requests carry a slow ladder like `ladder(8)`, military keeps the fast default —
+    /// in the SAME driver call). `None` = the run's `MoverConfig::stuck_thresholds`.
+    pub stuck_thresholds: Option<StuckThresholds>,
 }
 
 impl SimMoveRequest {
@@ -97,14 +109,28 @@ impl SimMoveRequest {
             creep,
             goal: SimMoveGoal::To { target, range },
             priority: MovementPriority::Normal,
+            priority_value: None,
             shove: true,
             anchor: None,
+            stuck_thresholds: None,
         }
     }
 
     /// Set the contention priority (e.g. `High` for a combat creep that must win the shooting tile).
     pub fn with_priority(mut self, priority: MovementPriority) -> Self {
         self.priority = priority;
+        self
+    }
+
+    /// Set a NUMERIC priority on the shared i64 lane (overrides the enum for resolver ordering).
+    pub fn with_priority_value(mut self, value: i64) -> Self {
+        self.priority_value = Some(value);
+        self
+    }
+
+    /// Override the stuck-escalation ladder for THIS request only (`None` stays the run config).
+    pub fn with_stuck_thresholds(mut self, thresholds: StuckThresholds) -> Self {
+        self.stuck_thresholds = Some(thresholds);
         self
     }
 
@@ -260,17 +286,18 @@ pub fn resolve_moves_via_system_with<S: CostMatrixDataSource + 'static>(
     // combat layer's threat matrices), exactly as live. Built Handle-sorted, lowest id kept on a
     // (degenerate) stacked tile — the resolver's `current_pos_to_entity` defence-in-depth pattern,
     // so the map is a pure function of the world, never of HashMap iteration order.
-    // ⚠ OPT-IN (`config.register_idle_creeps`, default OFF): registration's proactive resolver
-    // avoidance DESTROYS THE STUCK SIGNAL — a denied mover sidesteps every tick (constant motion,
-    // `ticks_immobile` never accrues), so the friendly-avoid/ops escalation tiers never fire and a
-    // parked creep sealing a 1-wide corridor starves its mate in a zero-failed-intent DANCE
-    // livelock (the rover-eval corpus ratchets caught it: pinch 7/8 trips, E11N1 11/12). The
-    // completing design — idle-DENIALS must count as immobility so the dance feeds the escalation
-    // ladder — is a recorded follow-up slice with its own tournament validation; until it lands,
-    // the default stays the proven push-fail-escalate behavior (bounded failed intents per event).
-    // LIVE-FIDELITY NOTE: the live bot does NOT register idle creeps today (ibex
-    // pathing/movementsystem.rs passes none), so offline-with-hook is BETTER-than-live
-    // coordination; mirroring this registration in the bot crate is part of the same follow-up.
+    // DEFAULT ON (flipped with the parked-creep-coordination-v2 slice; opt-out via
+    // `config.register_idle_creeps`). Registration originally shipped OPT-IN because proactive
+    // resolver avoidance destroyed the stuck signal — a denied mover sidestepped every tick, the
+    // escalation tiers never fired, and a parked creep sealing a 1-wide corridor starved its
+    // mate in a zero-failed-intent DANCE livelock (the rover-eval corpus ratchets caught it:
+    // pinch 7/8 trips, E11N1 11/12). That dance livelock is FIXED at the source: (a)
+    // DENIAL-AS-STUCK — the resolver marks idle-occupant denials and rover books them as
+    // immobility even through avoidance sidesteps, so the ladder climbs and friendly-avoid/shove
+    // fire; (b) SHOVEABLE IDLES — registered occupants get synthesized lowest-anchor resolver
+    // entries, so a mover with real priority displaces a corridor-mouth parker outright (see
+    // the corridor tests below). LIVE parity: the bot registers its idle creeps the same way
+    // (ibex pathing/movementsystem.rs) since the same slice.
     if config.register_idle_creeps {
         let requested: std::collections::HashSet<CreepId> =
             requests.iter().map(|r| r.creep).collect();
@@ -307,6 +334,12 @@ pub fn resolve_moves_via_system_with<S: CostMatrixDataSource + 'static>(
                     .allow_shove(req.shove)
                     .allow_swap(req.shove)
                     .priority(req.priority);
+                if let Some(value) = req.priority_value {
+                    mr.priority_value(value);
+                }
+                if let Some(thresholds) = &req.stuck_thresholds {
+                    mr.stuck_thresholds(thresholds.clone());
+                }
                 if let Some((position, range)) = req.anchor {
                     mr.anchor(AnchorConstraint { position, range });
                 }
@@ -323,6 +356,12 @@ pub fn resolve_moves_via_system_with<S: CostMatrixDataSource + 'static>(
                 mr.allow_shove(req.shove)
                     .allow_swap(req.shove)
                     .priority(req.priority);
+                if let Some(value) = req.priority_value {
+                    mr.priority_value(value);
+                }
+                if let Some(thresholds) = &req.stuck_thresholds {
+                    mr.stuck_thresholds(thresholds.clone());
+                }
                 if let Some((position, range)) = req.anchor {
                     mr.anchor(AnchorConstraint { position, range });
                 }
@@ -346,7 +385,7 @@ mod tests {
     use crate::world::SimCreep;
     use screeps::{LocalCostMatrix, Part, RoomCoordinate, RoomName};
     use screeps_rover::{
-        ConstructionSiteCostMatrixCache, CreepCostMatrixCache, LinearCostMatrix,
+        ConstructionSiteCostMatrixCache, CostMatrixWrite, CreepCostMatrixCache, LinearCostMatrix,
         StuctureCostMatrixCache,
     };
 
@@ -451,8 +490,8 @@ mod tests {
                 break;
             }
             let reqs = [SimMoveRequest::move_to(1, goal, 0)];
-            // OPT IN to parked-creep registration (default off pending the denial-as-stuck
-            // follow-up) — this test validates the opt-in mechanics end-to-end.
+            // Registration is default-ON since the parked-creep-coordination-v2 slice; stated
+            // explicitly here because THIS test is the registration seam's own gate.
             let cfg = MoverConfig { register_idle_creeps: true, ..Default::default() };
             let dirs = resolve_moves_via_system_with(&world, &reqs, &mut cache, PlainCostSource, &cfg);
             let mut intents = MoveIntents::new();
@@ -470,5 +509,189 @@ mod tests {
         );
         assert!(issued > 0, "the mover must actually have been driven");
         assert_eq!(world.creeps[1].pos, pos(15, 25), "the parked creep is routed around, not displaced");
+    }
+
+    /// Terrain + creep-occupancy pricing for the corridor tests — the minimal in-crate analogue
+    /// of rover-eval's `WorldCostSource`: walls impassable in the structure layer (rover's
+    /// resolver reads the same layer for shove/avoidance walkability), every living creep's tile
+    /// in the friendly layer (applied only under rover's stuck-escalation friendly-avoid tiers,
+    /// exactly like live). Rebuilt per tick from the world — matrix content is a pure set, so
+    /// HashSet iteration order cannot leak (the fence).
+    struct WallsAndCreepsCostSource {
+        walls: Vec<(u8, u8)>,
+        friendly: Vec<(u8, u8)>,
+    }
+    impl WallsAndCreepsCostSource {
+        fn snapshot(world: &MovementState) -> Self {
+            WallsAndCreepsCostSource {
+                walls: world.terrain.walls.iter().copied().collect(),
+                friendly: world
+                    .living_creeps()
+                    .map(|c| (c.pos.x().u8(), c.pos.y().u8()))
+                    .collect(),
+            }
+        }
+    }
+    impl CostMatrixDataSource for WallsAndCreepsCostSource {
+        fn get_structure_costs(&self, _r: RoomName) -> Option<StuctureCostMatrixCache> {
+            let mut other = LinearCostMatrix::new();
+            for &(x, y) in &self.walls {
+                other.set(x, y, u8::MAX);
+            }
+            Some(StuctureCostMatrixCache {
+                roads: LinearCostMatrix::new(),
+                other,
+            })
+        }
+        fn get_construction_site_costs(&self, _r: RoomName) -> Option<ConstructionSiteCostMatrixCache> {
+            None
+        }
+        fn get_creep_costs(&self, _r: RoomName) -> Option<CreepCostMatrixCache> {
+            let mut friendly_creeps = LinearCostMatrix::new();
+            for &(x, y) in &self.friendly {
+                friendly_creeps.set(x, y, u8::MAX);
+            }
+            Some(CreepCostMatrixCache {
+                friendly_creeps,
+                hostile_creeps: LinearCostMatrix::new(),
+                source_keeper_agro: LinearCostMatrix::new(),
+            })
+        }
+    }
+
+    /// A 1-wide corridor along y=25 sealed by FULL wall rows at y=24/y=26 (full rows, because a
+    /// finite wall block costs nothing to route over under Chebyshev step costs — an equal-length
+    /// diagonal path would dodge the corridor entirely and never meet the parker). `gaps` punches
+    /// doors into the y=24 row so a (much longer) detour exists where a test wants one.
+    fn corridor_world(gaps: &[(u8, u8)], mover_at: Position, idle_at: Position) -> MovementState {
+        let mut walls = std::collections::HashSet::new();
+        for x in 0..=49u8 {
+            walls.insert((x, 24u8));
+            walls.insert((x, 26u8));
+        }
+        for gap in gaps {
+            walls.remove(gap);
+        }
+        MovementState {
+            terrain: crate::SimTerrain {
+                walls,
+                ..Default::default()
+            },
+            creeps: vec![
+                SimCreep {
+                    id: 1,
+                    owner: 0,
+                    pos: mover_at,
+                    body: SimBody::unboosted(&[Part::Move]),
+                    fatigue: 0,
+                    carry_used: 0,
+                },
+                SimCreep {
+                    id: 2,
+                    owner: 0,
+                    pos: idle_at, // parked in the corridor, never requested
+                    body: SimBody::unboosted(&[Part::Move]),
+                    fatigue: 0,
+                    carry_used: 0,
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    /// Drive `reqs`-per-tick until creep 1 reaches `goal` (or `max_ticks`), applying via the real
+    /// kernel server. Returns (reached, issued, executed, final world).
+    fn drive_to_goal(
+        mut world: MovementState,
+        goal: Position,
+        max_ticks: u32,
+        request: impl Fn() -> SimMoveRequest,
+    ) -> (bool, usize, usize, MovementState) {
+        let mut cache = SimMoveCache::new();
+        let (mut issued, mut executed) = (0usize, 0usize);
+        let mut reached = false;
+        for _ in 0..max_ticks {
+            if world.creeps[0].pos == goal {
+                reached = true;
+                break;
+            }
+            let reqs = [request()];
+            let cost = WallsAndCreepsCostSource::snapshot(&world);
+            let cfg = MoverConfig { register_idle_creeps: true, ..Default::default() };
+            let dirs = resolve_moves_via_system_with(&world, &reqs, &mut cache, cost, &cfg);
+            let mut intents = MoveIntents::new();
+            for (&id, &d) in &dirs {
+                intents.set_move(id, d);
+            }
+            let report = resolve_movement(&mut world, &intents);
+            issued += dirs.len();
+            executed += report.moved.len();
+        }
+        (reached, issued, executed, world)
+    }
+
+    /// SHOVEABLE IDLES end-to-end: a Normal mover meets an idle parker sealing a 1-wide walled
+    /// corridor. The synthesized idle entry is displaceable (Low anchor < Normal), its shove
+    /// move is ISSUED and executed by the kernel server the same tick as the mover's — a
+    /// consistent pair, ZERO failed moves, and the corridor unseals.
+    #[test]
+    fn normal_mover_displaces_an_idle_corridor_parker_with_zero_failed_moves() {
+        let goal = pos(20, 25);
+        // Fully sealed corridor: displacement is the ONLY way through.
+        let world = corridor_world(&[], pos(10, 25), pos(15, 25));
+        let (reached, issued, executed, world) =
+            drive_to_goal(world, goal, 60, || SimMoveRequest::move_to(1, goal, 0));
+        assert!(reached, "mover must clear the sealed corridor via displacement, ended at {:?}", world.creeps[0].pos);
+        assert_eq!(executed, issued, "displacement is a consistent pair — zero failed moves");
+        assert_ne!(world.creeps[1].pos, pos(15, 25), "the idle parker was displaced out of the mouth");
+        assert_ne!(world.creeps[0].pos, world.creeps[1].pos, "end state is collision-free");
+    }
+
+    /// DENIAL-AS-STUCK end-to-end (detour available): a LOW-priority mover may not displace the
+    /// idle (Low ties the idle's anchor; the priority gate denies) — its denials accrue as
+    /// immobility, tier-1 friendly-avoid fires, and it repaths around the corridor block (the
+    /// occupancy-carrying cost source prices the parked tile) and arrives WITHOUT ever
+    /// displacing the parker. The denial burn before the detour stays bounded.
+    #[test]
+    fn low_mover_detours_around_an_idle_parker_via_denial_as_stuck() {
+        let goal = pos(20, 25);
+        // Two doors in the north wall row, both far from the straight route: the optimistic
+        // shortest path is STILL the corridor through the parker (10 steps vs ~40 via the
+        // doors), so the mover must be denied first — only the friendly-avoid repath (which
+        // prices the parked tile) chooses the door detour.
+        let world = corridor_world(&[(5, 24), (25, 24)], pos(10, 25), pos(15, 25));
+        let (reached, issued, executed, world) = drive_to_goal(world, goal, 120, || {
+            SimMoveRequest::move_to(1, goal, 0).with_priority(MovementPriority::Low)
+        });
+        assert!(reached, "denied mover must escalate and detour, ended at {:?}", world.creeps[0].pos);
+        assert_eq!(world.creeps[1].pos, pos(15, 25), "the idle parker must stay undisturbed");
+        let failed = issued - executed;
+        assert!(
+            failed <= 6,
+            "denial burn before tier-1 fires must stay bounded (failed: {})",
+            failed
+        );
+    }
+
+    /// DENIAL-AS-STUCK end-to-end (NO detour): full wall rows seal the room into one corridor.
+    /// The Low mover's friendly-avoid repaths keep failing (there is no other route), so the
+    /// ladder keeps climbing: at the resolver's stuck-shove tier the parker is displaced (the
+    /// engine-faithful escape) — the mover terminates instead of dancing forever.
+    #[test]
+    fn low_mover_eventually_displaces_when_the_corridor_has_no_detour() {
+        let goal = pos(17, 25);
+        // Wall rows across the WHOLE room, no doors: no route around exists.
+        let world = corridor_world(&[], pos(11, 25), pos(15, 25));
+        let (reached, issued, executed, world) = drive_to_goal(world, goal, 80, || {
+            SimMoveRequest::move_to(1, goal, 0).with_priority(MovementPriority::Low)
+        });
+        assert!(reached, "sealed corridor must terminate via stuck-tier displacement, ended at {:?}", world.creeps[0].pos);
+        assert_ne!(world.creeps[1].pos, pos(15, 25), "the parker was eventually displaced");
+        let failed = issued - executed;
+        assert!(
+            failed <= 30,
+            "the push-fail ladder is bounded per displacement event (failed: {})",
+            failed
+        );
     }
 }
