@@ -43,6 +43,11 @@ pub struct MoverConfig {
     /// The stuck-escalation ladder — how fast blocked creeps escalate through
     /// friendly-avoid → all-friendly → more-ops → shove → report-failure.
     pub stuck_thresholds: StuckThresholds,
+    /// Register unrequested same-side creeps as resolver-known stationary occupants
+    /// (`set_idle_creep_positions`). OPT-IN, default `false`: proactive avoidance without the
+    /// denial-as-stuck signal starves sealed corridors (see the registration block in
+    /// [`resolve_moves_via_system_with`]); flips to default-on when that follow-up slice lands.
+    pub register_idle_creeps: bool,
 }
 
 impl Default for MoverConfig {
@@ -53,6 +58,7 @@ impl Default for MoverConfig {
             pathfinding_ops_budget: 20_000,
             friendly_creep_distance: screeps_rover::DEFAULT_FRIENDLY_CREEP_DISTANCE,
             stuck_thresholds: StuckThresholds::default(),
+            register_idle_creeps: false,
         }
     }
 }
@@ -233,13 +239,62 @@ pub fn resolve_moves_via_system_with<S: CostMatrixDataSource + 'static>(
     system.set_pathfinding_ops_budget(config.pathfinding_ops_budget);
     system.set_friendly_creep_distance(config.friendly_creep_distance);
     system.set_stuck_thresholds(config.stuck_thresholds.clone());
-    // Offline there is no CPU meter, so the budgets are unlimited — REQUIRED, not cosmetic: rover
-    // treats an ABSENT budget as EXHAUSTED (`is_none_or(exhausted)`, movementsystem.rs:435), which
-    // silently disables ALL stuck-escalation and expiry repathing. Without these two lines a stuck
-    // creep re-issues its blocked move forever (a permanent livelock the rover-eval failed-move
-    // sentinel caught). Work is still bounded deterministically by the pathfinding ops budget.
+    // Offline there is no CPU meter, so the budgets are explicitly unlimited. HISTORICAL RECORD:
+    // when these lines landed, rover treated an ABSENT budget as EXHAUSTED (`is_none_or`,
+    // pre-2026-07-01 `is_cpu_budget_exhausted`), which silently disabled ALL stuck-escalation and
+    // expiry repathing here — a stuck creep re-issued its blocked move forever (the permanent
+    // livelock the rover-eval failed-move sentinel caught, ADR 0033 §M4 F1). Rover now treats
+    // None as UNLIMITED (fixed at the source, aligned with `is_over_tick_limit`), so these two
+    // lines are belt-and-braces: kept so the offline contract is stated, not inherited. Work
+    // stays bounded deterministically by the pathfinding ops budget.
     system.set_cpu_budget(|| 0.0, f64::MAX);
     system.set_repath_budget(|| 0.0, f64::MAX);
+
+    // PARKED-CREEP REGISTRATION (ADR 0033 §M4 F2 — the `failed_into_parked` eliminator): every
+    // living creep with NO request this tick is a known stationary occupant for exactly one tick
+    // — the driver sees both the world and the request set, so it registers them and the resolver
+    // routes around parked creeps DELIBERATELY instead of pathing into them optimistically and
+    // burning `ticks_immobile ≥ 2` engine-rejected intents per blocking event. Scoped to the
+    // REQUESTERS' owners: an unrequested creep of another owner is not "idle", it is an opponent
+    // moved by its own driver call — pricing hostiles stays the injected cost source's job (the
+    // combat layer's threat matrices), exactly as live. Built Handle-sorted, lowest id kept on a
+    // (degenerate) stacked tile — the resolver's `current_pos_to_entity` defence-in-depth pattern,
+    // so the map is a pure function of the world, never of HashMap iteration order.
+    // ⚠ OPT-IN (`config.register_idle_creeps`, default OFF): registration's proactive resolver
+    // avoidance DESTROYS THE STUCK SIGNAL — a denied mover sidesteps every tick (constant motion,
+    // `ticks_immobile` never accrues), so the friendly-avoid/ops escalation tiers never fire and a
+    // parked creep sealing a 1-wide corridor starves its mate in a zero-failed-intent DANCE
+    // livelock (the rover-eval corpus ratchets caught it: pinch 7/8 trips, E11N1 11/12). The
+    // completing design — idle-DENIALS must count as immobility so the dance feeds the escalation
+    // ladder — is a recorded follow-up slice with its own tournament validation; until it lands,
+    // the default stays the proven push-fail-escalate behavior (bounded failed intents per event).
+    // LIVE-FIDELITY NOTE: the live bot does NOT register idle creeps today (ibex
+    // pathing/movementsystem.rs passes none), so offline-with-hook is BETTER-than-live
+    // coordination; mirroring this registration in the bot crate is part of the same follow-up.
+    if config.register_idle_creeps {
+        let requested: std::collections::HashSet<CreepId> =
+            requests.iter().map(|r| r.creep).collect();
+        let requester_owners: std::collections::HashSet<_> = movement
+            .creeps
+            .iter()
+            .filter(|c| requested.contains(&c.id))
+            .map(|c| c.owner)
+            .collect();
+        let mut parked: Vec<(CreepId, Position)> = movement
+            .creeps
+            .iter()
+            .filter(|c| {
+                c.is_alive() && !requested.contains(&c.id) && requester_owners.contains(&c.owner)
+            })
+            .map(|c| (c.id, c.pos))
+            .collect();
+        parked.sort_unstable_by_key(|(id, _)| *id);
+        let mut idle: HashMap<Position, CreepId> = HashMap::new();
+        for (id, pos) in parked {
+            idle.entry(pos).or_insert(id);
+        }
+        system.set_idle_creep_positions(idle);
+    }
 
     // The MovementSystem routes to the (possibly cross-room) target directly — the rover search is
     // multi-room, so no MoveToRoom pre-projection is needed.
@@ -353,5 +408,67 @@ mod tests {
             }
         }
         assert!(reached, "driver should route the creep east to its goal, ended at {:?}", world.creeps[0].pos);
+    }
+
+    /// PARKED-CREEP REGISTRATION end-to-end (ADR 0033 §M4 F2): creep 2 sits mid-route with NO
+    /// request — the goal-reached "parked" shape that used to be invisible to rover (its
+    /// optimistic first-path runs straight through the tile; the engine then rejects the issued
+    /// move for `ticks_immobile ≥ 2` per blocking event — `failed_into_parked`). With the driver
+    /// auto-registering unrequested same-side creeps via `set_idle_creep_positions`, the resolver
+    /// sidesteps around it deliberately. Gate: applying the issued dirs via `resolve_movement`
+    /// executes EVERY intent (moved == issued — zero failed moves), the mover arrives, and the
+    /// parked creep is never displaced.
+    #[test]
+    fn routes_around_a_parked_unrequested_creep_without_failed_moves() {
+        let mut world = MovementState {
+            creeps: vec![
+                SimCreep {
+                    id: 1,
+                    owner: 0,
+                    pos: pos(10, 25),
+                    body: SimBody::unboosted(&[Part::Move]),
+                    fatigue: 0,
+                    carry_used: 0,
+                },
+                SimCreep {
+                    id: 2,
+                    owner: 0,
+                    pos: pos(15, 25), // parked ON the straight-line route, never requested
+                    body: SimBody::unboosted(&[Part::Move]),
+                    fatigue: 0,
+                    carry_used: 0,
+                },
+            ],
+            ..Default::default()
+        };
+        let goal = pos(20, 25);
+        let mut cache = SimMoveCache::new();
+        let mut reached = false;
+        let (mut issued, mut executed) = (0usize, 0usize);
+        for _ in 0..40 {
+            if world.creeps[0].pos == goal {
+                reached = true;
+                break;
+            }
+            let reqs = [SimMoveRequest::move_to(1, goal, 0)];
+            // OPT IN to parked-creep registration (default off pending the denial-as-stuck
+            // follow-up) — this test validates the opt-in mechanics end-to-end.
+            let cfg = MoverConfig { register_idle_creeps: true, ..Default::default() };
+            let dirs = resolve_moves_via_system_with(&world, &reqs, &mut cache, PlainCostSource, &cfg);
+            let mut intents = MoveIntents::new();
+            for (&id, &d) in &dirs {
+                intents.set_move(id, d);
+            }
+            let report = resolve_movement(&mut world, &intents);
+            issued += dirs.len();
+            executed += report.moved.len();
+        }
+        assert!(reached, "mover must arrive despite the parked blocker, ended at {:?}", world.creeps[0].pos);
+        assert_eq!(
+            executed, issued,
+            "every issued intent must execute — a shortfall is a failed move into the parked tile"
+        );
+        assert!(issued > 0, "the mover must actually have been driven");
+        assert_eq!(world.creeps[1].pos, pos(15, 25), "the parked creep is routed around, not displaced");
     }
 }
