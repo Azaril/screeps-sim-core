@@ -185,6 +185,13 @@ pub fn resolve_moves_via_system<S: CostMatrixDataSource + 'static>(
     let mut pf = LocalPathfinder;
     let mut system = MovementSystem::new(&mut cms, &mut pf, None);
     system.set_max_shove_depth(DEFAULT_SHOVE_DEPTH);
+    // Offline there is no CPU meter, so the budgets are unlimited — REQUIRED, not cosmetic: rover
+    // treats an ABSENT budget as EXHAUSTED (`is_none_or(exhausted)`, movementsystem.rs:435), which
+    // silently disables ALL stuck-escalation and expiry repathing. Without these two lines a stuck
+    // creep re-issues its blocked move forever (a permanent livelock the rover-eval failed-move
+    // sentinel caught). Work is still bounded deterministically by the pathfinding ops budget.
+    system.set_cpu_budget(|| 0.0, f64::MAX);
+    system.set_repath_budget(|| 0.0, f64::MAX);
 
     // The MovementSystem routes to the (possibly cross-room) target directly — the rover search is
     // multi-room, so no MoveToRoom pre-projection is needed.
