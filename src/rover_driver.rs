@@ -16,7 +16,7 @@ use screeps_rover::traits::CreepHandle;
 use screeps_rover::{
     AnchorConstraint, CostMatrixCache, CostMatrixDataSource, CostMatrixSystem, CreepMovementData,
     FleeTarget, LocalPathfinder, MovementData, MovementError, MovementPriority, MovementSystem,
-    MovementSystemExternal,
+    MovementSystemExternal, StuckThresholds,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -24,6 +24,38 @@ use std::rc::Rc;
 
 /// Default shove-chain depth for the sim mover (matches the live tuning).
 pub const DEFAULT_SHOVE_DEPTH: u32 = 3;
+
+/// The rover tunables one driver run is configured with (ADR 0033 §D5.4 tuning). Everything the
+/// `MovementSystem` exposes as a deterministic knob, in one injectable value — the unit a parameter
+/// tournament sweeps. `Default` mirrors the live defaults exactly, so the plain
+/// [`resolve_moves_via_system`] is byte-identical to the pre-config behavior.
+#[derive(Clone, Debug)]
+pub struct MoverConfig {
+    /// Resolver shove-chain depth (live default 3).
+    pub max_shove_depth: u32,
+    /// Ticks a cached path is followed before an expiry repath — path COMMITMENT (live default 20,
+    /// tournament-tuned 5→20; see rover's `DEFAULT_REUSE_PATH_LENGTH` rationale).
+    pub reuse_path_length: u32,
+    /// Per-tick pathfinding ops budget (1 op ≈ 0.001 CPU live; default 20_000).
+    pub pathfinding_ops_budget: u32,
+    /// Chebyshev radius for tier-1 friendly-avoid escalation (0 = all friendlies).
+    pub friendly_creep_distance: u32,
+    /// The stuck-escalation ladder — how fast blocked creeps escalate through
+    /// friendly-avoid → all-friendly → more-ops → shove → report-failure.
+    pub stuck_thresholds: StuckThresholds,
+}
+
+impl Default for MoverConfig {
+    fn default() -> Self {
+        MoverConfig {
+            max_shove_depth: DEFAULT_SHOVE_DEPTH,
+            reuse_path_length: 20,
+            pathfinding_ops_budget: 20_000,
+            friendly_creep_distance: screeps_rover::DEFAULT_FRIENDLY_CREEP_DISTANCE,
+            stuck_thresholds: StuckThresholds::default(),
+        }
+    }
+}
 
 /// Per-creep movement state (cached path + stuck tracking), persisted across ticks by the caller.
 pub type SimMoveCache = HashMap<CreepId, CreepMovementData>;
@@ -173,6 +205,18 @@ pub fn resolve_moves_via_system<S: CostMatrixDataSource + 'static>(
     cache: &mut SimMoveCache,
     cost_source: S,
 ) -> HashMap<CreepId, Direction> {
+    resolve_moves_via_system_with(movement, requests, cache, cost_source, &MoverConfig::default())
+}
+
+/// [`resolve_moves_via_system`] with explicit rover tunables — the entry point a parameter
+/// tournament sweeps (ADR 0033 §D5.4): same mover, one [`MoverConfig`] per evaluated point.
+pub fn resolve_moves_via_system_with<S: CostMatrixDataSource + 'static>(
+    movement: &MovementState,
+    requests: &[SimMoveRequest],
+    cache: &mut SimMoveCache,
+    cost_source: S,
+    config: &MoverConfig,
+) -> HashMap<CreepId, Direction> {
     let sink: MoveSink = Rc::new(RefCell::new(HashMap::new()));
     let mut external = SimMovementExternal {
         movement,
@@ -184,7 +228,11 @@ pub fn resolve_moves_via_system<S: CostMatrixDataSource + 'static>(
     let mut cms = CostMatrixSystem::new(&mut cm_cache, Box::new(cost_source));
     let mut pf = LocalPathfinder;
     let mut system = MovementSystem::new(&mut cms, &mut pf, None);
-    system.set_max_shove_depth(DEFAULT_SHOVE_DEPTH);
+    system.set_max_shove_depth(config.max_shove_depth);
+    system.set_reuse_path_length(config.reuse_path_length);
+    system.set_pathfinding_ops_budget(config.pathfinding_ops_budget);
+    system.set_friendly_creep_distance(config.friendly_creep_distance);
+    system.set_stuck_thresholds(config.stuck_thresholds.clone());
     // Offline there is no CPU meter, so the budgets are unlimited — REQUIRED, not cosmetic: rover
     // treats an ABSENT budget as EXHAUSTED (`is_none_or(exhausted)`, movementsystem.rs:435), which
     // silently disables ALL stuck-escalation and expiry repathing. Without these two lines a stuck

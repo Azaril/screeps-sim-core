@@ -37,5 +37,6 @@ pub use world::{CreepId, MovementState, PlayerId, SimCreep, StructureId};
 
 #[cfg(feature = "rover")]
 pub use rover_driver::{
-    resolve_moves_via_system, SimMoveCache, SimMoveGoal, SimMoveRequest, DEFAULT_SHOVE_DEPTH,
+    resolve_moves_via_system, resolve_moves_via_system_with, MoverConfig, SimMoveCache,
+    SimMoveGoal, SimMoveRequest, DEFAULT_SHOVE_DEPTH,
 };
