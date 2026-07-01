@@ -22,7 +22,6 @@
 //! `move.js:32` rejects it / `movement.js:88` clamps). The boundary cross is a separate **edge-exit
 //! relocation** in [`crate::resolve_tick`]'s Phase D (engine `creeps/tick.js:52` + `global.js:42`):
 //! a non-NPC creep standing on an exit tile is moved to the adjacent room's mirror tile.
-//! **Not modelled yet:** roads (fatigue stays plain/swamp). Tracked in `AGENTS.md`.
 
 use crate::world::*;
 use screeps::{Direction, Position, RoomCoordinate};
@@ -153,7 +152,7 @@ pub fn resolve_moves_with_pulls(
             current_pos: c.pos,
             dest_pos,
             move_rate: c.body.move_rate(),
-            weight: c.body.fatigue_weight().max(1),
+            weight: c.fatigue_weight().max(1),
             pulled: false,
             pulling: pullers.contains(&c.id),
         });
@@ -171,7 +170,7 @@ pub fn resolve_moves_with_pulls(
             current_pos: t.pos,
             dest_pos: p.pos, // into the puller's vacated tile
             move_rate: t.body.move_rate(),
-            weight: t.body.fatigue_weight().max(1),
+            weight: t.fatigue_weight().max(1),
             pulled: true,
             pulling: false,
         });
@@ -306,6 +305,7 @@ mod tests {
             pos: pos(x, y),
             body: SimBody::new(body),
             fatigue,
+            carry_used: 0,
         }
     }
     fn moves(pairs: &[(CreepId, Direction)]) -> HashMap<CreepId, Direction> {
@@ -554,6 +554,7 @@ mod tests {
                     pos: pos_in("W3N1", 24, 25),
                     body: SimBody::new(vec![crate::body::BodyPartDef::new(Part::Move)]),
                     fatigue: 0,
+                    carry_used: 0,
                 }],
                 ..Default::default()
             };
@@ -585,6 +586,7 @@ mod tests {
             pos: pos_in(name, 24, 25),
             body: SimBody::new(vec![crate::body::BodyPartDef::new(Part::Move)]),
             fatigue: 0,
+            carry_used: 0,
         };
         let world = MovementState {
             creeps: vec![mk(1, "W1N1"), mk(2, "W3N1")],

@@ -15,10 +15,17 @@ pub mod body;
 pub mod constants;
 pub mod intents;
 pub mod movement;
+pub mod rng;
 pub mod sim;
 pub mod terrain;
 pub mod tick;
 pub mod world;
+
+/// The offline rover driver (runs rover's `MovementSystem` over a `MovementState`). Behind the
+/// `rover` feature so the base kernel stays rover-free; enabled by `screeps-combat-agent` +
+/// `screeps-rover-eval`.
+#[cfg(feature = "rover")]
+pub mod rover_driver;
 
 pub use body::{BodyPartDef, BoostTier, SimBody};
 pub use intents::MoveIntents;
@@ -27,3 +34,8 @@ pub use sim::{MovementSim, Simulation};
 pub use terrain::SimTerrain;
 pub use tick::{resolve_movement, MovementReport};
 pub use world::{CreepId, MovementState, PlayerId, SimCreep, StructureId};
+
+#[cfg(feature = "rover")]
+pub use rover_driver::{
+    resolve_moves_via_system, SimMoveCache, SimMoveGoal, SimMoveRequest, DEFAULT_SHOVE_DEPTH,
+};

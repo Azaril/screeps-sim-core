@@ -40,9 +40,10 @@ pub fn resolve_movement(world: &mut MovementState, intents: &MoveIntents) -> Mov
             let move_fatigue = if is_edge(x, y) {
                 0
             } else {
-                // Room-aware: fatigue from the DESTINATION room's terrain.
+                // Room-aware: fatigue from the DESTINATION room's terrain, weighted by the creep's
+                // full move-weight (structural parts + loaded CARRY).
                 let terrain = rooms.get(&np.room_name()).unwrap_or(default_terrain);
-                c.body.fatigue_weight() * terrain.fatigue_rate(x, y)
+                c.fatigue_weight() * terrain.fatigue_rate(x, y)
             };
             c.fatigue += move_fatigue;
         }
@@ -78,5 +79,69 @@ pub fn resolve_movement(world: &mut MovementState, intents: &MoveIntents) -> Mov
     MovementReport {
         tick: report_tick,
         moved: new_positions,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::body::{BodyPartDef, SimBody};
+    use crate::world::SimCreep;
+    use screeps::{Direction, Part, Position, RoomCoordinate, RoomName};
+
+    fn pos(x: u8, y: u8) -> Position {
+        let room: RoomName = "W1N1".parse().unwrap();
+        Position::new(RoomCoordinate::new(x).unwrap(), RoomCoordinate::new(y).unwrap(), room)
+    }
+    fn creep(body: &[Part], carry_used: u32) -> SimCreep {
+        SimCreep {
+            id: 1,
+            owner: 0,
+            pos: pos(25, 25),
+            body: SimBody::new(body.iter().map(|&p| BodyPartDef::new(p)).collect()),
+            fatigue: 0,
+            carry_used,
+        }
+    }
+    fn step_right(mut world: MovementState) -> u32 {
+        let mut mv = MoveIntents::new();
+        mv.set_move(1, Direction::Right);
+        resolve_movement(&mut world, &mv);
+        world.creeps[0].fatigue
+    }
+
+    #[test]
+    fn road_step_accrues_less_fatigue_than_plain() {
+        // Weight-2 body (2×ATTACK + 1×MOVE): plain rate 2 → +4, regen 2 → net 2.
+        let plain = step_right(MovementState {
+            creeps: vec![creep(&[Part::Attack, Part::Attack, Part::Move], 0)],
+            ..Default::default()
+        });
+        assert_eq!(plain, 2, "plain step: 2×2 − 2 = 2");
+
+        // Same body over a road at the destination (26,25): rate 1 → +2, regen 2 → net 0.
+        let mut roaded = MovementState {
+            creeps: vec![creep(&[Part::Attack, Part::Attack, Part::Move], 0)],
+            ..Default::default()
+        };
+        roaded.terrain.roads.insert((26, 25));
+        assert_eq!(step_right(roaded), 0, "road step: 2×1 − 2 = 0 (roads reduce fatigue)");
+    }
+
+    #[test]
+    fn loaded_carry_accrues_fatigue_an_empty_hauler_does_not() {
+        // Hauler [2×CARRY, 1×MOVE]: structural weight 0. Empty → 0 fatigue even after a plain step.
+        let empty = step_right(MovementState {
+            creeps: vec![creep(&[Part::Carry, Part::Carry, Part::Move], 0)],
+            ..Default::default()
+        });
+        assert_eq!(empty, 0, "an empty hauler accrues no move-fatigue");
+
+        // Loaded with 100 (2 CARRY units): weight 2, plain rate 2 → +4, regen 2 → net 2.
+        let loaded = step_right(MovementState {
+            creeps: vec![creep(&[Part::Carry, Part::Carry, Part::Move], 100)],
+            ..Default::default()
+        });
+        assert_eq!(loaded, 2, "a fully loaded hauler accrues fatigue (2×2 − 2 = 2)");
     }
 }

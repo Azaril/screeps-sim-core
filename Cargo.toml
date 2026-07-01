@@ -18,4 +18,7 @@ rover = ["dep:screeps-rover"]
 [dependencies]
 screeps-game-api = "0.23"
 serde = { version = "1", features = ["derive"] }
-screeps-rover = { path = "../screeps-rover", optional = true }
+# Rover as a git dep (redirected to the local tree by the root [patch]) so this crate builds
+# standalone, matching the workspace convention — NOT a path dep. Optional: only the `rover` feature
+# (the offline MovementSystem driver) pulls it; the base kernel stays rover-free.
+screeps-rover = { git = "https://github.com/Azaril/screeps-rover", optional = true }

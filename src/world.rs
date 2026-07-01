@@ -23,11 +23,21 @@ pub struct SimCreep {
     pub body: SimBody,
     /// Fatigue carried into this tick; the creep may move only when it is 0.
     pub fatigue: u32,
+    /// Total resources aboard (all types summed, engine `_.sum(creep.store)`). Raises move-fatigue
+    /// via the loaded-CARRY weight ([`SimBody::carry_weight`]). Combat creeps carry nothing → `0`.
+    pub carry_used: u32,
 }
 
 impl SimCreep {
     pub fn is_alive(&self) -> bool {
         self.body.is_alive()
+    }
+
+    /// The full move-fatigue *weight*: structural non-MOVE/non-CARRY parts plus the loaded-CARRY
+    /// units for the resources aboard (engine `movement.js:119-123,237-238`). This is the multiplier
+    /// on terrain fatigue rate per step, and (min 1) the contention rate4 denominator.
+    pub fn fatigue_weight(&self) -> u32 {
+        self.body.fatigue_weight() + self.body.carry_weight(self.carry_used)
     }
 }
 

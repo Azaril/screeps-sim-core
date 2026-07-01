@@ -1,0 +1,302 @@
+//! The offline **rover driver** (ADR 0033 M1) — the headless analogue of the live
+//! `MovementSystemExternalProvider`. It runs rover's real `MovementSystem` (resolver + `LocalPathfinder`)
+//! over a [`MovementState`] and returns one `Direction` per creep, to hand to
+//! [`resolve_movement`](crate::resolve_movement) (the "server"). Gated behind the `rover` feature so the
+//! base kernel stays rover-free.
+//!
+//! **Layering:** this is the movement *mechanism* only. It is generic over the routing cost — the caller
+//! injects a [`CostMatrixDataSource`] ("pricing policy", per ADR 0033 / "no one-off pathfinding"): a
+//! combat layer supplies tower/threat/structure obstacles (`screeps-combat-agent`), a movement/economy
+//! benchmark supplies plain terrain (`screeps-rover-eval`). The driver reads only `MovementState`
+//! (creeps + terrain), never any combat state — that is why it lives in the kernel.
+
+use crate::world::{CreepId, MovementState};
+use screeps::{Direction, Position};
+use screeps_rover::traits::CreepHandle;
+use screeps_rover::{
+    AnchorConstraint, CostMatrixCache, CostMatrixDataSource, CostMatrixSystem, CreepMovementData,
+    FleeTarget, LocalPathfinder, MovementData, MovementError, MovementPriority, MovementSystem,
+    MovementSystemExternal,
+};
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
+
+/// Default shove-chain depth for the sim mover (matches the live tuning).
+pub const DEFAULT_SHOVE_DEPTH: u32 = 3;
+
+/// Per-creep movement state (cached path + stuck tracking), persisted across ticks by the caller.
+pub type SimMoveCache = HashMap<CreepId, CreepMovementData>;
+
+/// A movement goal for [`resolve_moves_via_system`].
+pub enum SimMoveGoal {
+    /// Reach `target` within `range`.
+    To { target: Position, range: u32 },
+    /// Flee to outside `range` of every threat.
+    Flee { threats: Vec<Position>, range: u32 },
+}
+
+/// A per-creep movement request for [`resolve_moves_via_system`]. `priority` decides who wins a
+/// contested tile (the resolver orders by priority before any tie-break) — e.g. a squad's combat
+/// creep takes `High` so it claims the forward kite/shooting spot over a support creep.
+pub struct SimMoveRequest {
+    pub creep: CreepId,
+    pub goal: SimMoveGoal,
+    pub priority: MovementPriority,
+    /// Allow the resolver to SHOVE/swap others to reach the tile (the rover default). Toggle off to A/B
+    /// shoving's effect on positioning (the investigated control).
+    pub shove: bool,
+    /// Optional anchor `(center, range)`: confine the resolver's shoves/swaps for this creep to within
+    /// `range` of `center` so a cohesive squad can't be scattered off its scored tiles (the rover
+    /// `AnchorConstraint`). `None` = unconstrained.
+    pub anchor: Option<(Position, u32)>,
+}
+
+impl SimMoveRequest {
+    /// A `move_to` request (default priority, shove on): reach `target` within `range`.
+    pub fn move_to(creep: CreepId, target: Position, range: u32) -> Self {
+        SimMoveRequest {
+            creep,
+            goal: SimMoveGoal::To { target, range },
+            priority: MovementPriority::Normal,
+            shove: true,
+            anchor: None,
+        }
+    }
+
+    /// Set the contention priority (e.g. `High` for a combat creep that must win the shooting tile).
+    pub fn with_priority(mut self, priority: MovementPriority) -> Self {
+        self.priority = priority;
+        self
+    }
+
+    /// Enable/disable shoving for this request (the investigated control).
+    pub fn with_shove(mut self, shove: bool) -> Self {
+        self.shove = shove;
+        self
+    }
+
+    /// Confine this creep's shoves/swaps to within `range` of `center` (anti-scatter anchor).
+    pub fn with_anchor(mut self, center: Position, range: u32) -> Self {
+        self.anchor = Some((center, range));
+        self
+    }
+}
+
+/// Shared sink the creep handles write their resolved direction into (`move_direction` is `&self`,
+/// mirroring the live `creep.move()`, so it needs interior mutability).
+type MoveSink = Rc<RefCell<HashMap<CreepId, Direction>>>;
+
+/// A [`CreepHandle`] over a `SimCreep` snapshot; `move_direction` records into the shared sink (the
+/// sim's analogue of issuing `creep.move(dir)` to the server).
+struct SimCreepHandle {
+    id: CreepId,
+    pos: Position,
+    fatigue: u32,
+    sink: MoveSink,
+}
+
+impl CreepHandle for SimCreepHandle {
+    fn pos(&self) -> Position {
+        self.pos
+    }
+    fn fatigue(&self) -> u32 {
+        self.fatigue
+    }
+    fn spawning(&self) -> bool {
+        false
+    }
+    fn move_direction(&self, dir: Direction) -> Result<(), String> {
+        self.sink.borrow_mut().insert(self.id, dir);
+        Ok(())
+    }
+    fn pull(&self, _other: &Self) -> Result<(), String> {
+        Ok(()) // pull chains: a sim follow-up (the engine supports Intents.pulls); no-op for now.
+    }
+    fn move_pulled_by(&self, _other: &Self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// [`MovementState`]-backed [`MovementSystemExternal`] — the headless analogue of the live
+/// `MovementSystemExternalProvider`. Owns the move sink, borrows the world + the caller's cache. Reads
+/// only `movement.creeps` (positions + fatigue) — no combat state, which is why it is kernel code.
+struct SimMovementExternal<'w, 'c> {
+    movement: &'w MovementState,
+    sink: MoveSink,
+    cache: &'c mut SimMoveCache,
+}
+
+impl MovementSystemExternal<CreepId> for SimMovementExternal<'_, '_> {
+    type Creep = SimCreepHandle;
+
+    fn get_creep(&self, entity: CreepId) -> Result<SimCreepHandle, MovementError> {
+        let c = self
+            .movement
+            .creeps
+            .iter()
+            .find(|c| c.id == entity && c.is_alive())
+            .ok_or_else(|| "creep not found".to_owned())?;
+        Ok(SimCreepHandle {
+            id: entity,
+            pos: c.pos,
+            fatigue: c.fatigue,
+            sink: self.sink.clone(),
+        })
+    }
+
+    fn get_creep_movement_data(
+        &mut self,
+        entity: CreepId,
+    ) -> Result<&mut CreepMovementData, MovementError> {
+        Ok(self.cache.entry(entity).or_default())
+    }
+
+    fn get_entity_position(&self, entity: CreepId) -> Option<Position> {
+        self.movement
+            .creeps
+            .iter()
+            .find(|c| c.id == entity && c.is_alive())
+            .map(|c| c.pos)
+    }
+}
+
+/// Run rover's `MovementSystem` (resolver included) over `movement` for `requests`, returning the
+/// resolved per-creep directions to hand to [`resolve_movement`](crate::resolve_movement). `cache` is
+/// the caller's persisted per-creep movement state (path reuse + stuck-escalation accumulate across
+/// ticks). `cost_source` is the caller's routing policy — the ONLY layering seam: combat injects
+/// tower/threat/structure obstacles, a movement benchmark injects plain terrain. This is the
+/// traffic-managed, unified analogue of routing each creep individually.
+pub fn resolve_moves_via_system<S: CostMatrixDataSource + 'static>(
+    movement: &MovementState,
+    requests: &[SimMoveRequest],
+    cache: &mut SimMoveCache,
+    cost_source: S,
+) -> HashMap<CreepId, Direction> {
+    let sink: MoveSink = Rc::new(RefCell::new(HashMap::new()));
+    let mut external = SimMovementExternal {
+        movement,
+        sink: sink.clone(),
+        cache,
+    };
+
+    let mut cm_cache = CostMatrixCache::default();
+    let mut cms = CostMatrixSystem::new(&mut cm_cache, Box::new(cost_source));
+    let mut pf = LocalPathfinder;
+    let mut system = MovementSystem::new(&mut cms, &mut pf, None);
+    system.set_max_shove_depth(DEFAULT_SHOVE_DEPTH);
+
+    // The MovementSystem routes to the (possibly cross-room) target directly — the rover search is
+    // multi-room, so no MoveToRoom pre-projection is needed.
+    let mut data = MovementData::new();
+    for req in requests {
+        match &req.goal {
+            SimMoveGoal::To { target, range } => {
+                let mut mr = data.move_to(req.creep, *target);
+                mr.range(*range)
+                    .allow_shove(req.shove)
+                    .allow_swap(req.shove)
+                    .priority(req.priority);
+                if let Some((position, range)) = req.anchor {
+                    mr.anchor(AnchorConstraint { position, range });
+                }
+            }
+            SimMoveGoal::Flee { threats, range } => {
+                let targets: Vec<FleeTarget> = threats
+                    .iter()
+                    .map(|p| FleeTarget {
+                        pos: *p,
+                        range: *range,
+                    })
+                    .collect();
+                let mut mr = data.flee(req.creep, targets);
+                mr.allow_shove(req.shove)
+                    .allow_swap(req.shove)
+                    .priority(req.priority);
+                if let Some((position, range)) = req.anchor {
+                    mr.anchor(AnchorConstraint { position, range });
+                }
+            }
+        }
+    }
+    let _ = system.process(&mut external, data);
+
+    drop(external);
+    Rc::try_unwrap(sink)
+        .map(|c| c.into_inner())
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::body::SimBody;
+    use crate::intents::MoveIntents;
+    use crate::tick::resolve_movement;
+    use crate::world::SimCreep;
+    use screeps::{LocalCostMatrix, Part, RoomCoordinate, RoomName};
+    use screeps_rover::{
+        ConstructionSiteCostMatrixCache, CreepCostMatrixCache, LinearCostMatrix,
+        StuctureCostMatrixCache,
+    };
+
+    fn pos(x: u8, y: u8) -> Position {
+        let room: RoomName = "W1N1".parse().unwrap();
+        Position::new(RoomCoordinate::new(x).unwrap(), RoomCoordinate::new(y).unwrap(), room)
+    }
+
+    /// The minimal pricing policy: open plains everywhere (empty matrices). Proves the kernel driver
+    /// works with a NON-combat cost source — the reuse the benchmark (M4) depends on.
+    struct PlainCostSource;
+    impl CostMatrixDataSource for PlainCostSource {
+        fn get_structure_costs(&self, _r: RoomName) -> Option<StuctureCostMatrixCache> {
+            Some(StuctureCostMatrixCache {
+                roads: LinearCostMatrix::new(),
+                other: LinearCostMatrix::new(),
+            })
+        }
+        fn get_construction_site_costs(&self, _r: RoomName) -> Option<ConstructionSiteCostMatrixCache> {
+            None
+        }
+        fn get_creep_costs(&self, _r: RoomName) -> Option<CreepCostMatrixCache> {
+            Some(CreepCostMatrixCache {
+                friendly_creeps: LinearCostMatrix::new(),
+                hostile_creeps: LinearCostMatrix::new(),
+                source_keeper_agro: LinearCostMatrix::new(),
+            })
+        }
+    }
+    // Touch LocalCostMatrix so the import is used across screeps versions where the alias differs.
+    const _: fn() -> LocalCostMatrix = LocalCostMatrix::new;
+
+    #[test]
+    fn drives_a_lone_creep_to_its_goal_over_open_plains() {
+        let mut world = MovementState {
+            creeps: vec![SimCreep {
+                id: 1,
+                owner: 0,
+                pos: pos(10, 25),
+                body: SimBody::unboosted(&[Part::Move]),
+                fatigue: 0,
+                carry_used: 0,
+            }],
+            ..Default::default()
+        };
+        let mut cache = SimMoveCache::new();
+        let mut reached = false;
+        for _ in 0..40 {
+            let reqs = [SimMoveRequest::move_to(1, pos(20, 25), 0)];
+            let dirs = resolve_moves_via_system(&world, &reqs, &mut cache, PlainCostSource);
+            let mut intents = MoveIntents::new();
+            for (&id, &d) in &dirs {
+                intents.set_move(id, d);
+            }
+            resolve_movement(&mut world, &intents);
+            if world.creeps[0].pos == pos(20, 25) {
+                reached = true;
+                break;
+            }
+        }
+        assert!(reached, "driver should route the creep east to its goal, ended at {:?}", world.creeps[0].pos);
+    }
+}

@@ -1,7 +1,8 @@
-//! The creep body model — per-part 100-hit pools, back-to-front degradation, boost-aware
-//! action power (`calcBodyEffectiveness`), and the TOUGH/boost damage reduction (`_applyDamage`).
-//! Faithful to the engine; see the cited source per function. The action-power/damage methods are
-//! body arithmetic (a property of a body), not combat *resolution* — that lives in the combat overlay.
+//! The creep body model — per-part 100-hit pools, back-to-front degradation, and the boost-aware
+//! effectiveness helper (`calcBodyEffectiveness`) the movement kernel needs (MOVE/fatigue counts).
+//! Faithful to the engine; see the cited source per function. Body-COMBAT arithmetic (attack/heal/
+//! dismantle power, TOUGH/boost damage reduction) is NOT here — the mover never needs it; it lives
+//! in the combat layer as the `SimBodyCombat` extension trait (`screeps-combat-engine`, ADR 0033).
 
 use crate::constants::*;
 use screeps::Part;
@@ -45,6 +46,13 @@ impl BoostTier {
     /// Fatigue-clear multiplier for a MOVE part (`BOOSTS[MOVE][ZO|ZHO2|XZHO2].fatigue`): ×1/2/3/4.
     pub fn move_mult(self) -> f64 {
         self.action_mult()
+    }
+
+    /// Carry-capacity multiplier for a CARRY part (`BOOSTS[CARRY][KH|KH2O|XKH2O].capacity`): ×1/2/3/4
+    /// — the same tier ladder as [`action_mult`](Self::action_mult), returned as an integer since a
+    /// boosted CARRY holds `CARRY_CAPACITY × mult` resources exactly.
+    pub fn carry_capacity_mult(self) -> u32 {
+        self.action_mult() as u32
     }
 }
 
@@ -123,22 +131,6 @@ impl SimBody {
         power as u32
     }
 
-    pub fn attack_power(&self) -> u32 {
-        self.effective_power(Part::Attack, ATTACK_POWER)
-    }
-    pub fn ranged_attack_power(&self) -> u32 {
-        self.effective_power(Part::RangedAttack, RANGED_ATTACK_POWER)
-    }
-    pub fn heal_power(&self) -> u32 {
-        self.effective_power(Part::Heal, HEAL_POWER)
-    }
-    pub fn ranged_heal_power(&self) -> u32 {
-        self.effective_power(Part::Heal, RANGED_HEAL_POWER)
-    }
-    pub fn dismantle_power(&self) -> u32 {
-        self.effective_power(Part::Work, DISMANTLE_POWER)
-    }
-
     /// Count of ALIVE (`hits > 0`) parts of `part_type` — the raw, un-boost-weighted count (for replay
     /// composition display: "this creep is 8×TOUGH + 25×WORK"). Degrades as front parts are destroyed.
     pub fn alive_part_count(&self, part_type: Part) -> u32 {
@@ -151,8 +143,9 @@ impl SimBody {
         self.effective_power(Part::Move, 1)
     }
 
-    /// Count of alive non-MOVE/non-CARRY parts — the fatigue *weight* (`movement.js:120,237`):
-    /// the multiplier on terrain rate when a move adds fatigue, and (min 1) the tiebreak denominator.
+    /// Count of alive non-MOVE/non-CARRY parts — the *structural* fatigue weight (`movement.js:120,237`).
+    /// The full move-fatigue weight also adds the loaded-CARRY units ([`carry_weight`](Self::carry_weight));
+    /// use [`SimCreep::fatigue_weight`](crate::SimCreep::fatigue_weight), which sums both.
     pub fn fatigue_weight(&self) -> u32 {
         let mut n = 0;
         for (i, p) in self.parts.iter().enumerate() {
@@ -161,6 +154,27 @@ impl SimBody {
             }
         }
         n
+    }
+
+    /// Loaded-CARRY fatigue units for `carry_used` resources aboard (`calcResourcesWeight`,
+    /// `movement.js:41`): walking the body back-to-front, each ALIVE CARRY part absorbs
+    /// `CARRY_CAPACITY × capacity_boost` of the load and adds 1 to the weight, until the load is
+    /// exhausted. An empty creep (`carry_used == 0`) adds nothing; empty CARRY parts are weightless.
+    pub fn carry_weight(&self, carry_used: u32) -> u32 {
+        let mut remaining = carry_used;
+        let mut weight = 0;
+        for i in (0..self.parts.len()).rev() {
+            if remaining == 0 {
+                break;
+            }
+            let p = self.parts[i];
+            if p.part != Part::Carry || self.part_hits(i) == 0 {
+                continue;
+            }
+            remaining = remaining.saturating_sub(CARRY_CAPACITY * p.boost.carry_capacity_mult());
+            weight += 1;
+        }
+        weight
     }
 
     /// True if the creep has at least one working MOVE part (engine `canMove`).
@@ -181,39 +195,6 @@ impl SimBody {
         }
         (FATIGUE_CLEAR_PER_MOVE as f64 * mult) as u32
     }
-
-    /// Damage actually inflicted after TOUGH/boost reduction, given `raw` incoming this tick
-    /// (engine `_applyDamage`, `creeps/tick.js:7-29`). Pure — does **not** mutate `hits`; the
-    /// caller nets damage-then-heal in the resolve pass. Iterates parts front-to-back, each
-    /// absorbing up to `part_hits / damage_ratio` "effective" hits; only TOUGH boosts have a
-    /// `damage_ratio < 1`, and the accumulated reduction is rounded **once** at the end.
-    pub fn damage_after_tough(&self, raw: u32) -> u32 {
-        if raw == 0 {
-            return 0;
-        }
-        // The reduction loop only runs if any part is boosted (engine `_.any(body, i => !!i.boost)`).
-        if !self.parts.iter().any(|p| p.boost != BoostTier::None) {
-            return raw;
-        }
-        let mut damage_reduce = 0.0;
-        let mut damage_effective = raw as f64;
-        for (i, p) in self.parts.iter().enumerate() {
-            if damage_effective <= 0.0 {
-                break;
-            }
-            let part_hits = self.part_hits(i) as f64;
-            let ratio = if p.part == Part::Tough {
-                p.boost.tough_damage_ratio()
-            } else {
-                1.0
-            };
-            let effective = part_hits / ratio;
-            let absorbed = effective.min(damage_effective);
-            damage_reduce += absorbed * (1.0 - ratio);
-            damage_effective -= absorbed;
-        }
-        (raw as f64 - damage_reduce.round()).max(0.0) as u32
-    }
 }
 
 #[cfg(test)]
@@ -227,29 +208,6 @@ mod tests {
                 .map(|&(p, b)| BodyPartDef::boosted(p, b))
                 .collect(),
         )
-    }
-
-    #[test]
-    fn action_power_unboosted_and_boosted() {
-        let five_attack = body(&[(Part::Attack, BoostTier::None); 5]);
-        assert_eq!(five_attack.attack_power(), 150); // 5 × 30
-
-        let five_attack_t3 = body(&[(Part::Attack, BoostTier::T3); 5]);
-        assert_eq!(five_attack_t3.attack_power(), 600); // 5 × 30 × 4
-
-        let heal = body(&[(Part::Heal, BoostTier::None); 4]);
-        assert_eq!(heal.heal_power(), 48); // 4 × 12
-        assert_eq!(heal.ranged_heal_power(), 16); // 4 × 4
-
-        let heal_t3 = body(&[(Part::Heal, BoostTier::T3); 4]);
-        assert_eq!(heal_t3.heal_power(), 192); // 4 × 12 × 4
-        assert_eq!(heal_t3.ranged_heal_power(), 64); // 4 × 4 × 4
-
-        let ranged = body(&[(Part::RangedAttack, BoostTier::None); 7]);
-        assert_eq!(ranged.ranged_attack_power(), 70); // 7 × 10
-
-        let work = body(&[(Part::Work, BoostTier::T3); 10]);
-        assert_eq!(work.dismantle_power(), 2000); // 10 × 50 × 4
     }
 
     #[test]
@@ -271,11 +229,7 @@ mod tests {
     #[test]
     fn power_degrades_as_front_parts_die() {
         let mut b = SimBody::unboosted(&[Part::Tough, Part::Attack, Part::Move]);
-        assert_eq!(b.attack_power(), 30); // attack part alive
-        b.hits = 150; // attack part (index 1) still has 50 hits
-        assert_eq!(b.attack_power(), 30);
-        b.hits = 100; // now only the Move part (index 2) is alive; attack is dead
-        assert_eq!(b.attack_power(), 0);
+        b.hits = 100; // only the Move part (index 2) is alive; the front parts are dead
         assert_eq!(b.fatigue_clear(), 2); // the surviving MOVE still clears fatigue
     }
 
@@ -287,39 +241,22 @@ mod tests {
     }
 
     #[test]
-    fn unboosted_takes_full_damage() {
-        let b = SimBody::unboosted(&[Part::Tough, Part::Attack]);
-        assert_eq!(b.damage_after_tough(100), 100); // no boost → no reduction
+    fn carry_weight_counts_loaded_parts_only() {
+        // 3×CARRY + 1×MOVE: capacity 150. Weight = ceil(load / 50), capped at 3 alive CARRY parts.
+        let b = SimBody::unboosted(&[Part::Carry, Part::Carry, Part::Carry, Part::Move]);
+        assert_eq!(b.carry_weight(0), 0, "an empty creep adds no carry weight");
+        assert_eq!(b.carry_weight(1), 1, "any load needs its first CARRY part");
+        assert_eq!(b.carry_weight(50), 1, "one full part");
+        assert_eq!(b.carry_weight(51), 2, "spills into a second part");
+        assert_eq!(b.carry_weight(150), 3, "all three parts loaded");
+        assert_eq!(b.carry_weight(999), 3, "capped at the alive CARRY count");
     }
 
     #[test]
-    fn tough_reduces_within_capacity() {
-        // 10 full XGHO2 TOUGH (T3, ×0.3) + 1 MOVE: 100 raw is well within the ~3333 effective
-        // capacity, so it's reduced straight to ×0.3 = 30.
-        let mut parts: Vec<(Part, BoostTier)> = vec![(Part::Tough, BoostTier::T3); 10];
-        parts.push((Part::Move, BoostTier::None));
-        assert_eq!(body(&parts).damage_after_tough(100), 30);
-    }
-
-    #[test]
-    fn tough_capacity_exceeded_spills_unreduced() {
-        // 1 full XGHO2 TOUGH (eff capacity 100/0.3 ≈ 333) + 1 MOVE, raw 500: the first 333
-        // effective is reduced (Σ reduce = 333.33 × 0.7 = 233.33 → round 233), the rest hits
-        // unreduced. Result = 500 − 233 = 267.
-        let b = body(&[(Part::Tough, BoostTier::T3), (Part::Move, BoostTier::None)]);
-        assert_eq!(b.damage_after_tough(500), 267);
-    }
-
-    #[test]
-    fn dead_tough_gives_no_mitigation() {
-        // [Tough(T3), Attack] at 100 hits → Tough (front) is dead, Attack (back) full. A dead
-        // TOUGH part absorbs nothing, so damage passes unreduced.
-        let mut b = body(&[
-            (Part::Tough, BoostTier::T3),
-            (Part::Attack, BoostTier::None),
-        ]);
-        b.hits = 100;
-        assert_eq!(b.part_hits(0), 0);
-        assert_eq!(b.damage_after_tough(50), 50);
+    fn carry_weight_is_boost_aware() {
+        // A T2 CARRY part (×3 capacity) holds 150, so 150 of load is one part's worth.
+        let b = body(&[(Part::Carry, BoostTier::T2), (Part::Move, BoostTier::None)]);
+        assert_eq!(b.carry_weight(150), 1, "a ×3-boosted CARRY absorbs 150 in one part");
+        assert_eq!(b.carry_weight(151), 1, "still one part — but the load exceeds capacity (capped)");
     }
 }
