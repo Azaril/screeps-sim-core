@@ -511,6 +511,143 @@ mod tests {
         assert_eq!(world.creeps[1].pos, pos(15, 25), "the parked creep is routed around, not displaced");
     }
 
+    /// FATIGUED-REQUESTED OCCUPANCY (ADR 0033 M5, the swamp-contention `failed_coordination`
+    /// class): a fatigued creep IN the request set cannot execute any move this tick (engine
+    /// `canMove`), but it occupies its tile through the whole movement phase. Historically Pass 1
+    /// dropped it entirely — no `ResolvedCreep` entry, and not in `idle_creep_positions` either
+    /// (it IS requested) — so the resolver planned the other creep straight through its tile and
+    /// the engine rejected the issued intent. Gate: the fatigued creep is issued NO move, every
+    /// issued intent executes (moved == issued), and the mover still arrives.
+    #[test]
+    fn fatigued_requested_creep_blocks_its_tile_without_failed_moves() {
+        let mut world = MovementState {
+            creeps: vec![
+                SimCreep {
+                    id: 1,
+                    owner: 0,
+                    pos: pos(10, 25),
+                    body: SimBody::unboosted(&[Part::Move]),
+                    fatigue: 0,
+                    carry_used: 0,
+                },
+                SimCreep {
+                    id: 2,
+                    owner: 0,
+                    pos: pos(11, 25), // directly on creep 1's straight-line route, FATIGUED
+                    body: SimBody::unboosted(&[Part::Move]),
+                    fatigue: 8,
+                    carry_used: 0,
+                },
+            ],
+            ..Default::default()
+        };
+        let goal = pos(20, 25);
+        let mut cache = SimMoveCache::new();
+        let (mut issued, mut executed) = (0usize, 0usize);
+        let mut reached = false;
+        for _ in 0..40 {
+            if world.creeps[0].pos == goal {
+                reached = true;
+                break;
+            }
+            // Creep 2 is REQUESTED (mid-route, still fatigued from a heavy leg) — the exact
+            // shape that used to be invisible to the resolver's occupancy model.
+            let reqs = [
+                SimMoveRequest::move_to(1, goal, 0),
+                SimMoveRequest::move_to(2, pos(11, 25), 0),
+            ];
+            let dirs = resolve_moves_via_system(&world, &reqs, &mut cache, PlainCostSource);
+            let fatigued_at_start = world.creeps[1].fatigue > 0;
+            if fatigued_at_start {
+                assert!(
+                    !dirs.contains_key(&2),
+                    "a fatigued creep must never be issued a move intent (engine-dropped)"
+                );
+            }
+            let mut intents = MoveIntents::new();
+            for (&id, &d) in &dirs {
+                intents.set_move(id, d);
+            }
+            let report = resolve_movement(&mut world, &intents);
+            issued += dirs.len();
+            executed += report.moved.len();
+        }
+        assert!(reached, "mover must arrive around the fatigued blocker, ended at {:?}", world.creeps[0].pos);
+        assert_eq!(
+            executed, issued,
+            "every issued intent must execute — a shortfall is a move planned through the \
+             fatigued creep's tile (the failed_coordination class)"
+        );
+        assert!(issued > 0, "the mover must actually have been driven");
+    }
+
+    fn pos_in(room: &str, x: u8, y: u8) -> Position {
+        Position::new(
+            RoomCoordinate::new(x).unwrap(),
+            RoomCoordinate::new(y).unwrap(),
+            room.parse::<RoomName>().unwrap(),
+        )
+    }
+
+    /// BORDER-CROSSER model (ADR 0033 M5, the border-wide `failed_wall` class): a creep standing
+    /// ON an exit tile (the just-crossed / bounced-back state — the kernel's edge relocation puts
+    /// creeps there every crossing) whose next path step is the adjacent room's mirror tile must
+    /// be issued NO move intent: the engine drops an off-edge move at registration
+    /// (`move.js:32`), and the unconditional end-of-tick relocation performs the cross for free.
+    /// Gate: zero intents issued from the seam tick, the relocation carries the creep across,
+    /// every later issued intent executes, and the creep arrives.
+    #[test]
+    fn border_crosser_issues_no_outward_intent_and_crosses_via_relocation() {
+        let mut world = MovementState {
+            creeps: vec![SimCreep {
+                id: 1,
+                owner: 0,
+                pos: pos_in("W1N1", 0, 25), // standing on W1N1's WEST exit tile
+                body: SimBody::unboosted(&[Part::Move]),
+                fatigue: 0,
+                carry_used: 0,
+            }],
+            ..Default::default()
+        };
+        let goal = pos_in("W2N1", 40, 25);
+        let mut cache = SimMoveCache::new();
+
+        // Tick 1: the next path step is the mirror tile W2N1(49,25) — cross-room, NOT a move.
+        let reqs = [SimMoveRequest::move_to(1, goal, 1)];
+        let dirs = resolve_moves_via_system(&world, &reqs, &mut cache, PlainCostSource);
+        assert!(
+            dirs.is_empty(),
+            "a border-crosser on the exit tile must be issued no intent, got {dirs:?}"
+        );
+        resolve_movement(&mut world, &MoveIntents::new());
+        assert_eq!(
+            world.creeps[0].pos,
+            pos_in("W2N1", 49, 25),
+            "the edge relocation must carry the crosser to the mirror tile"
+        );
+
+        // Then it walks in-room to the goal with a fully consistent intent stream.
+        let (mut issued, mut executed) = (0usize, 0usize);
+        let mut reached = false;
+        for _ in 0..30 {
+            if world.creeps[0].pos.get_range_to(goal) <= 1 {
+                reached = true;
+                break;
+            }
+            let reqs = [SimMoveRequest::move_to(1, goal, 1)];
+            let dirs = resolve_moves_via_system(&world, &reqs, &mut cache, PlainCostSource);
+            let mut intents = MoveIntents::new();
+            for (&id, &d) in &dirs {
+                intents.set_move(id, d);
+            }
+            let report = resolve_movement(&mut world, &intents);
+            issued += dirs.len();
+            executed += report.moved.len();
+        }
+        assert!(reached, "crosser must arrive, ended at {:?}", world.creeps[0].pos);
+        assert_eq!(executed, issued, "no wasted intents after the cross");
+    }
+
     /// Terrain + creep-occupancy pricing for the corridor tests — the minimal in-crate analogue
     /// of rover-eval's `WorldCostSource`: walls impassable in the structure layer (rover's
     /// resolver reads the same layer for shove/avoidance walkability), every living creep's tile
