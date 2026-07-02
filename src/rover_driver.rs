@@ -18,6 +18,9 @@ use screeps_rover::{
     FleeTarget, LocalPathfinder, MovementData, MovementError, MovementPriority, MovementSystem,
     MovementSystemExternal, StuckThresholds,
 };
+// Re-exported so stats-variant callers (the rover-eval ops bench, future telemetry consumers)
+// name the per-tick stats type through the driver seam without a direct rover import.
+pub use screeps_rover::MovementTickStats;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -249,6 +252,26 @@ pub fn resolve_moves_via_system_with<S: CostMatrixDataSource + 'static>(
     cost_source: S,
     config: &MoverConfig,
 ) -> HashMap<CreepId, Direction> {
+    resolve_moves_via_system_stats(movement, requests, cache, cost_source, config).0
+}
+
+/// [`resolve_moves_via_system_with`] that also returns rover's per-tick telemetry
+/// ([`MovementTickStats`]: `ops_budget_cap` / `ops_consumed` / `repaths`, read via
+/// `MovementSystem::tick_stats()` before the system drops) — the op-counted PRIMARY currency the
+/// rover-eval CPU bench pins its §D5.3 scaling curves in, and the same struct live records into
+/// the seg-57 `pathing` block, so offline and live ops streams stay the same quantity by
+/// definition. This variant is the ONE implementation; the plain functions above delegate and
+/// drop the stats (no churn for direction-only callers). Its existence deletes the bench's
+/// historical mirror driver (`rover-eval/bench.rs::resolve_with_stats`), which existed solely
+/// because this driver constructed its `MovementSystem` internally and dropped it before
+/// `tick_stats()` could be read (the recorded M5-rest follow-up).
+pub fn resolve_moves_via_system_stats<S: CostMatrixDataSource + 'static>(
+    movement: &MovementState,
+    requests: &[SimMoveRequest],
+    cache: &mut SimMoveCache,
+    cost_source: S,
+    config: &MoverConfig,
+) -> (HashMap<CreepId, Direction>, MovementTickStats) {
     let sink: MoveSink = Rc::new(RefCell::new(HashMap::new()));
     let mut external = SimMovementExternal {
         movement,
@@ -369,11 +392,15 @@ pub fn resolve_moves_via_system_with<S: CostMatrixDataSource + 'static>(
         }
     }
     let _ = system.process(&mut external, data);
+    // Read the per-tick telemetry BEFORE the system drops — the whole reason this variant exists.
+    let stats = system.tick_stats();
 
+    drop(system);
     drop(external);
-    Rc::try_unwrap(sink)
+    let dirs = Rc::try_unwrap(sink)
         .map(|c| c.into_inner())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    (dirs, stats)
 }
 
 #[cfg(test)]
@@ -808,6 +835,99 @@ mod tests {
             "denial burn before tier-1 fires must stay bounded (failed: {})",
             failed
         );
+    }
+
+    /// STATIC-MINER VISIBILITY end-to-end (ADR 0033 slice 7 — the ARRIVED-no-consent Pass-1
+    /// hole): creep 2 is a static miner HOLDING its corridor tile as a live request (`move_to`
+    /// own tile, range 0, `Immovable`, shove/swap consent OFF — the live static-miner shape).
+    /// Historically an arrived no-consent request got NO `ResolvedCreep` entry at all (Pass 1's
+    /// arrived arm only inserted on `allow_shove || allow_swap`), so the miner was INVISIBLE —
+    /// movers pathed into it optimistically and burned engine-rejected intents per blocking
+    /// event. Post-fix the miner is a pre-resolved stationary occupant: the mover is denied at
+    /// grant (never issued into the tile), its denials mark `denied_by_idle` so the ladder
+    /// climbs through the avoidance dance, and the friendly-avoid repath (the cost source
+    /// prices the miner's tile) takes the door detour. Gate: the mover arrives, EVERY issued
+    /// intent executes (zero engine-rejected moves — the slice-5 sim-core end-to-end shape),
+    /// and the miner never budges.
+    #[test]
+    fn mover_routes_around_an_arrived_no_consent_miner_without_failed_moves() {
+        let goal = pos(20, 25);
+        let miner_at = pos(15, 25);
+        // Two doors in the north wall row, far from the straight route: the optimistic shortest
+        // path is STILL the corridor through the miner, so only the escalated (occupancy-priced)
+        // repath finds the detour — exactly the dance the denial marking must terminate.
+        let mut world = corridor_world(&[(5, 24), (25, 24)], pos(10, 25), miner_at);
+        let mut cache = SimMoveCache::new();
+        let (mut issued, mut executed) = (0usize, 0usize);
+        let mut reached = false;
+        for _ in 0..120 {
+            if world.creeps[0].pos == goal {
+                reached = true;
+                break;
+            }
+            let reqs = [
+                SimMoveRequest::move_to(1, goal, 0),
+                // The static-miner hold: arrived every tick, consents to NOTHING.
+                SimMoveRequest::move_to(2, miner_at, 0)
+                    .with_priority(MovementPriority::Immovable)
+                    .with_shove(false),
+            ];
+            let cost = WallsAndCreepsCostSource::snapshot(&world);
+            let dirs = resolve_moves_via_system(&world, &reqs, &mut cache, cost);
+            assert!(
+                !dirs.contains_key(&2),
+                "an arrived holder must never be issued a move intent"
+            );
+            let mut intents = MoveIntents::new();
+            for (&id, &d) in &dirs {
+                intents.set_move(id, d);
+            }
+            let report = resolve_movement(&mut world, &intents);
+            issued += dirs.len();
+            executed += report.moved.len();
+        }
+        assert!(reached, "mover must detour around the miner, ended at {:?}", world.creeps[0].pos);
+        assert_eq!(world.creeps[1].pos, miner_at, "the no-consent miner is never displaced");
+        assert_eq!(
+            executed, issued,
+            "every issued intent must execute — a shortfall is an engine-rejected move into the \
+             (formerly invisible) miner's tile"
+        );
+        assert!(issued > 0, "the mover must actually have been driven");
+    }
+
+    /// The stats seam ([`resolve_moves_via_system_stats`], ADR 0033 slice 7): the per-tick
+    /// telemetry surfaces through the kernel driver — a first-tick search consumes real, counted
+    /// ops under the configured cap and books exactly one path generation — and the plain
+    /// direction-only entry point returns the identical move set (pure delegation).
+    #[test]
+    fn stats_variant_surfaces_tick_stats_and_delegation_is_identical() {
+        let world = MovementState {
+            creeps: vec![SimCreep {
+                id: 1,
+                owner: 0,
+                pos: pos(10, 25),
+                body: SimBody::unboosted(&[Part::Move]),
+                fatigue: 0,
+                carry_used: 0,
+            }],
+            ..Default::default()
+        };
+        let cfg = MoverConfig::default();
+        let reqs = [SimMoveRequest::move_to(1, pos(20, 25), 0)];
+
+        let mut cache_a = SimMoveCache::new();
+        let (dirs, stats) =
+            resolve_moves_via_system_stats(&world, &reqs, &mut cache_a, PlainCostSource, &cfg);
+        assert_eq!(stats.ops_budget_cap, cfg.pathfinding_ops_budget, "cap echoes the config");
+        assert!(stats.ops_consumed > 0, "the first-tick search consumes counted ops");
+        assert!(stats.ops_consumed <= stats.ops_budget_cap, "ops never exceed the cap");
+        assert_eq!(stats.repaths, 1, "exactly one path generation (the first-time search)");
+
+        let mut cache_b = SimMoveCache::new();
+        let plain =
+            resolve_moves_via_system_with(&world, &reqs, &mut cache_b, PlainCostSource, &cfg);
+        assert_eq!(plain, dirs, "the direction-only entry point is pure delegation");
     }
 
     /// DENIAL-AS-STUCK end-to-end (NO detour): full wall rows seal the room into one corridor.
