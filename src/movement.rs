@@ -106,6 +106,12 @@ pub fn resolve_moves(
 /// creep it drags: a pulled creep follows the puller into its vacated tile and is eligible even with
 /// **no MOVE part / nonzero fatigue** (engine `canMove`'s `_pulled` branch) — this is how no-MOVE /
 /// under-MOVE combat compositions stay mobile. Returns movers → new position.
+///
+/// **Pull-conflict determinism:** when two pullers pull the SAME target the same tick, the LOWEST
+/// puller id wins (first-wins over the sorted pairs below). The engine's own outcome here is JS
+/// hash order — explicitly unordered (`processor.js:227` iteration, see the tick-model docs) — so
+/// a fixed id order is the deterministic stand-in, exactly like the OR-fold occupancy test below:
+/// no `HashMap` iteration may reach a result (the determinism fence class).
 pub fn resolve_moves_with_pulls(
     world: &MovementState,
     moves: &HashMap<CreepId, Direction>,
@@ -119,12 +125,16 @@ pub fn resolve_moves_with_pulls(
         .collect();
 
     // Valid pulls: puller + target alive, adjacent, puller has a move intent. `pulled_by` maps the
-    // dragged creep → its puller and overrides the dragged creep's own move intent.
+    // dragged creep → its puller and overrides the dragged creep's own move intent. Iterate the
+    // pairs SORTED by puller id and keep the first insert per target, so a two-pullers-one-target
+    // conflict resolves to the lowest puller id — never to `pulls`' HashMap iteration order.
+    let mut pull_pairs: Vec<(CreepId, CreepId)> = pulls.iter().map(|(&p, &t)| (p, t)).collect();
+    pull_pairs.sort_unstable();
     let mut pulled_by: HashMap<CreepId, CreepId> = HashMap::new();
-    for (&puller, &target) in pulls {
+    for (puller, target) in pull_pairs {
         if let (Some(p), Some(t)) = (creep_by_id.get(&puller), creep_by_id.get(&target)) {
             if moves.contains_key(&puller) && p.pos.get_range_to(t.pos) <= 1 {
-                pulled_by.insert(target, puller);
+                pulled_by.entry(target).or_insert(puller);
             }
         }
     }
@@ -158,8 +168,13 @@ pub fn resolve_moves_with_pulls(
         });
     }
     // Pulled creeps follow their puller into its current tile (only if the puller is itself moving).
+    // Push them in target-id order: the `movers` Vec index is the contention tie-break lane (equal
+    // rates keep the earlier index), so its order must never come from `pulled_by`'s hash order.
     let self_mover_ids: HashSet<CreepId> = movers.iter().map(|m| m.id).collect();
-    for (&target, &puller) in &pulled_by {
+    let mut pulled_sorted: Vec<(CreepId, CreepId)> =
+        pulled_by.iter().map(|(&t, &p)| (t, p)).collect();
+    pulled_sorted.sort_unstable();
+    for (target, puller) in pulled_sorted {
         if !self_mover_ids.contains(&puller) {
             continue; // puller isn't moving → nothing to follow into
         }
@@ -480,6 +495,38 @@ mod tests {
             Some(&pos(25, 25)),
             "fatigue does not stop a pulled creep"
         );
+    }
+
+    #[test]
+    fn conflicting_pulls_resolve_to_the_lowest_puller_id() {
+        // TWO pullers drag the SAME no-MOVE target the same tick: puller 5 at (25,25)→Right
+        // (vacating (25,25)) and puller 9 at (23,25)→Left (vacating (23,25)); the target sits at
+        // (24,25), adjacent to both. The winner must be the LOWEST puller id (5) — deterministically,
+        // across permuted insertion orders and fresh HashMap seeds (the engine's own outcome is JS
+        // hash order — unordered — so the sorted first-wins rule is the deterministic stand-in).
+        let world = MovementState {
+            creeps: vec![
+                creep(5, 25, 25, &[(Part::Move, 1)], 0),
+                creep(9, 23, 25, &[(Part::Move, 1)], 0),
+                creep(7, 24, 25, &[(Part::Attack, 1)], 0), // no MOVE: only a pull moves it
+            ],
+            ..Default::default()
+        };
+        let mvs = moves(&[(5, Direction::Right), (9, Direction::Left)]);
+        // 20 fresh maps per insertion order: std HashMap seeds differ per instance, so a
+        // hash-order-dependent implementation flips this within a run.
+        for _ in 0..20 {
+            for order in [[(5u32, 7u32), (9, 7)], [(9, 7), (5, 7)]] {
+                let r = resolve_moves_with_pulls(&world, &mvs, &pulls(&order));
+                assert_eq!(r.get(&5), Some(&pos(26, 25)), "winning puller advances");
+                assert_eq!(r.get(&9), Some(&pos(22, 25)), "losing puller still walks");
+                assert_eq!(
+                    r.get(&7),
+                    Some(&pos(25, 25)),
+                    "the target follows the LOWEST puller id's vacated tile, always"
+                );
+            }
+        }
     }
 
     #[test]
