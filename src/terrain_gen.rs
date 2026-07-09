@@ -83,6 +83,36 @@ fn flood_open(wall: &[[bool; N]; N], start: (usize, usize)) -> [[bool; N]; N] {
     region
 }
 
+/// The set of open (non-wall) tiles 8-connected to `start` in a `SimTerrain` — the creep-reachable
+/// region containing `start`. General helper for placing things (spawns, sources, squads, path
+/// endpoints) on CONNECTED terrain: an arbitrary tile in a generated room may be a wall or in an
+/// isolated pocket, so callers pick from this set. Swamps count as open (passable). Empty if `start`
+/// is itself a wall.
+pub fn connected_open(terrain: &SimTerrain, start: (u8, u8)) -> std::collections::HashSet<(u8, u8)> {
+    let mut region = std::collections::HashSet::new();
+    if terrain.walls.contains(&start) {
+        return region;
+    }
+    let mut stack = vec![start];
+    while let Some((x, y)) = stack.pop() {
+        if terrain.walls.contains(&(x, y)) || !region.insert((x, y)) {
+            continue;
+        }
+        for dy in -1i32..=1 {
+            for dx in -1i32..=1 {
+                if dx == 0 && dy == 0 {
+                    continue;
+                }
+                let (nx, ny) = (x as i32 + dx, y as i32 + dy);
+                if (0..N as i32).contains(&nx) && (0..N as i32).contains(&ny) {
+                    stack.push((nx as u8, ny as u8));
+                }
+            }
+        }
+    }
+    region
+}
+
 /// A room edge — which side an exit range sits on.
 #[derive(Clone, Copy, Debug)]
 pub enum EdgeDir {
