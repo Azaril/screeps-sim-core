@@ -136,7 +136,7 @@ fn generate_with_edges(cave_seed: u32, params: &TerrainGenParams, edges: &[(Edge
         }
     }
     let region = flood_open(&wall, (MID, MID));
-    let mut connect = |wall: &mut [[bool; N]; N], edge: (i32, i32), inward: (i32, i32)| {
+    let connect = |wall: &mut [[bool; N]; N], edge: (i32, i32), inward: (i32, i32)| {
         let (mut x, mut y) = edge;
         loop {
             wall[y as usize][x as usize] = false;
@@ -239,7 +239,7 @@ pub fn generate_terrain(seed: u32, params: &TerrainGenParams) -> SimTerrain {
 pub fn generate_terrain_for_room(room: RoomName, world_seed: u32, connect: Exits, params: &TerrainGenParams) -> SimTerrain {
     let self_id = room_id(room);
     let mut edges = Vec::new();
-    let mut add = |edges: &mut Vec<(EdgeDir, u8, u8)>, on: bool, dir: EdgeDir, tile: (u8, u8), off: (i32, i32)| {
+    let add = |edges: &mut Vec<(EdgeDir, u8, u8)>, on: bool, dir: EdgeDir, tile: (u8, u8), off: (i32, i32)| {
         if on {
             if let Some(n) = neighbour(room, tile, off) {
                 let (lo, hi) = seam_range(self_id, room_id(n));
