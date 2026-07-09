@@ -57,6 +57,31 @@ impl Default for TerrainGenParams {
     }
 }
 
+/// 8-connected flood-fill of the open (non-wall) tiles reachable from `start`. Matches creep
+/// movement (diagonals allowed), so a tile in the returned region is genuinely creep-reachable.
+fn flood_open(wall: &[[bool; N]; N], start: (usize, usize)) -> [[bool; N]; N] {
+    let mut region = [[false; N]; N];
+    let mut stack = vec![start];
+    while let Some((x, y)) = stack.pop() {
+        if wall[y][x] || region[y][x] {
+            continue;
+        }
+        region[y][x] = true;
+        for dy in -1i32..=1 {
+            for dx in -1i32..=1 {
+                if dx == 0 && dy == 0 {
+                    continue;
+                }
+                let (nx, ny) = (x as i32 + dx, y as i32 + dy);
+                if (0..N as i32).contains(&nx) && (0..N as i32).contains(&ny) {
+                    stack.push((nx as usize, ny as usize));
+                }
+            }
+        }
+    }
+    region
+}
+
 /// Generate a deterministic, engine-like room terrain (see module docs). Every requested exit is
 /// open and connected to the room centre.
 pub fn generate_terrain(seed: u32, params: &TerrainGenParams) -> SimTerrain {
@@ -97,35 +122,46 @@ pub fn generate_terrain(seed: u32, params: &TerrainGenParams) -> SimTerrain {
         wall = next;
     }
 
-    // 3. Carve each requested exit: clear a straight channel from the mid-edge tile to the centre
-    //    (an L-shaped Manhattan path), guaranteeing connectivity. Three parallel lines give a
-    //    ~3-wide mouth so the exit isn't single-file.
-    let carve = |wall: &mut [[bool; N]; N], from: (i32, i32)| {
-        let (mut x, mut y) = from;
-        let (cx, cy) = (MID as i32, MID as i32);
+    // 3. Connect the exits to the NATURAL cave, not via a straight highway: seed the centre open,
+    //    flood-fill it to find the main region, then connect each requested exit with a SHORT
+    //    inward carve that stops at the first region tile. The bulk of any cross-room path then
+    //    winds through the cave (routed ≫ straight-line — the whole point of realistic terrain),
+    //    while connectivity is still guaranteed. The exit band is `MID±1` (3-wide), aligned with
+    //    the neighbour room's opposing exit.
+    for dy in -1i32..=1 {
+        for dx in -1i32..=1 {
+            wall[(MID as i32 + dy) as usize][(MID as i32 + dx) as usize] = false;
+        }
+    }
+    let region = flood_open(&wall, (MID, MID));
+    let mut connect = |wall: &mut [[bool; N]; N], edge: (i32, i32), inward: (i32, i32)| {
+        let (mut x, mut y) = edge;
         loop {
             wall[y as usize][x as usize] = false;
-            if x != cx {
-                x += (cx - x).signum();
-            } else if y != cy {
-                y += (cy - y).signum();
-            } else {
+            let (nx, ny) = (x + inward.0, y + inward.1);
+            if nx < 0 || ny < 0 || nx >= N as i32 || ny >= N as i32 {
                 break;
             }
+            if region[ny as usize][nx as usize] {
+                break; // reached the natural cave region — let it carry the rest of the path
+            }
+            x = nx;
+            y = ny;
         }
     };
     for off in -1i32..=1 {
+        let b = MID as i32 + off;
         if params.exits.left {
-            carve(&mut wall, (0, MID as i32 + off));
+            connect(&mut wall, (0, b), (1, 0));
         }
         if params.exits.right {
-            carve(&mut wall, (N as i32 - 1, MID as i32 + off));
+            connect(&mut wall, (N as i32 - 1, b), (-1, 0));
         }
         if params.exits.top {
-            carve(&mut wall, (MID as i32 + off, 0));
+            connect(&mut wall, (b, 0), (0, 1));
         }
         if params.exits.bottom {
-            carve(&mut wall, (MID as i32 + off, N as i32 - 1));
+            connect(&mut wall, (b, N as i32 - 1), (0, -1));
         }
     }
 
