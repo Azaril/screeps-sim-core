@@ -18,6 +18,7 @@ pub mod movement;
 pub mod rng;
 pub mod sim;
 pub mod terrain;
+pub mod terrain_gen;
 pub mod tick;
 pub mod world;
 
