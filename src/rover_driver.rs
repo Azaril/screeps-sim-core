@@ -25,8 +25,12 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-/// Default shove-chain depth for the sim mover (matches the live tuning).
-pub const DEFAULT_SHOVE_DEPTH: u32 = 3;
+/// Default shove-chain depth for the sim mover. 10 IS the live value (parity H6, 2026-08-24):
+/// `PathingFeatures::default().max_shove_depth = 10` applied via `set_max_shove_depth`, and
+/// rover's own `DEFAULT_MAX_SHOVE_DEPTH` agrees - the old 3 (doc-claimed "live default") let
+/// live cascade displacement chains the sim refused, booking denials into the stuck ladder in
+/// exactly the crowded-formation cases the combat beds validate.
+pub const DEFAULT_SHOVE_DEPTH: u32 = 10;
 
 /// The rover tunables one driver run is configured with (ADR 0033 §D5.4 tuning). Everything the
 /// `MovementSystem` exposes as a deterministic knob, in one injectable value — the unit a parameter
@@ -34,7 +38,7 @@ pub const DEFAULT_SHOVE_DEPTH: u32 = 3;
 /// [`resolve_moves_via_system`] is byte-identical to the pre-config behavior.
 #[derive(Clone, Debug)]
 pub struct MoverConfig {
-    /// Resolver shove-chain depth (live default 3).
+    /// Resolver shove-chain depth (live default 10).
     pub max_shove_depth: u32,
     /// Ticks a cached path is followed before an expiry repath — path COMMITMENT (live default 20,
     /// tournament-tuned 5→20; see rover's `DEFAULT_REUSE_PATH_LENGTH` rationale).
@@ -62,6 +66,10 @@ impl Default for MoverConfig {
             max_shove_depth: DEFAULT_SHOVE_DEPTH,
             reuse_path_length: 20,
             pathfinding_ops_budget: 20_000,
+            // Parity M10 (2026-08-24): 5 = rover's default, now ALSO the live-applied value.
+            // Matching the sim to live's old hand-tuned 15 broke the cross-border assault bed
+            // (stuck travellers detoured around their whole formation and arrived strung out) -
+            // parity was resolved by moving LIVE to the tournament-validated 5 instead.
             friendly_creep_distance: screeps_rover::DEFAULT_FRIENDLY_CREEP_DISTANCE,
             stuck_thresholds: StuckThresholds::default(),
             register_idle_creeps: true,
@@ -376,8 +384,13 @@ pub fn resolve_moves_via_system_stats<S: CostMatrixDataSource + 'static>(
                     })
                     .collect();
                 let mut mr = data.flee(req.creep, targets);
+                // Parity M12 (2026-08-24): live's `MovementRequest::flee` withdraws with
+                // `allow_shove=false, allow_swap=true` - swapping with a teammate is the packed-
+                // corridor escape valve and is NOT shoving. The old `allow_swap(req.shove)` tied
+                // both to one knob, so sim flees (shove=false per REC-055) could never swap and
+                // retreat throughput diverged from live.
                 mr.allow_shove(req.shove)
-                    .allow_swap(req.shove)
+                    .allow_swap(true)
                     .priority(req.priority);
                 if let Some(value) = req.priority_value {
                     mr.priority_value(value);
