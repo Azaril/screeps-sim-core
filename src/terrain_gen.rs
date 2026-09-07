@@ -193,9 +193,9 @@ fn generate_with_edges(cave_seed: u32, params: &TerrainGenParams, edges: &[(Edge
 
     // 4. Materialise walls; swamp the non-wall tiles at the requested density.
     let mut terrain = SimTerrain::default();
-    for y in 0..N {
-        for x in 0..N {
-            if wall[y][x] {
+    for (y, row) in wall.iter().enumerate() {
+        for (x, &is_wall) in row.iter().enumerate() {
+            if is_wall {
                 terrain.walls.insert((x as u8, y as u8));
             } else if rng.range(0, 1000) < params.swamp_fill_permille {
                 terrain.swamps.insert((x as u8, y as u8));
